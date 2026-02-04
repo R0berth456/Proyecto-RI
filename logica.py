@@ -100,7 +100,7 @@ class MotorBusqueda:
         2. Justifica tu respuesta usando la información provista (RAG).
         3. Si el usuario pide un cambio (ej. "mejor en rojo"), busca en el contexto si hay algo relevante o explica que estás mostrando las mejores coincidencias visuales/textuales.
         4. Sé amable, breve y persuasivo.
-        """
+        5. Si la consulta actual no tiene relación con los productos, responde educadamente"""
         
         response = self.llm.models.generate_content(model="gemini-3-flash-preview", contents=prompt)
         return response.text
