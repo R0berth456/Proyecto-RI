@@ -71,7 +71,7 @@ for msg in st.session_state.mensajes:
 
 # CASO A: Búsqueda por Imagen
 if imagen_subida and btn_buscar_img:
-    image = Image.open(imagen_subida)
+    image = Image.open(BytesIO(imagen_subida.getvalue()))
     st.chat_message("user").image(image, caption="Imagen subida", width=200)
     st.session_state.mensajes.append({"role": "user", "content": "📸 [Imagen subida por el usuario]"})
     

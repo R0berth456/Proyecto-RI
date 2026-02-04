@@ -1,8 +1,9 @@
+from io import BytesIO
 import os
 import json
 import faiss
 import numpy as np
-import google.generativeai as genai
+from google import genai
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from PIL import Image
@@ -29,14 +30,13 @@ class MotorBusqueda:
         # 2. Cargar Modelos
         print("Cargando modelos de IA...")
         # Usamos clip-ViT-B-32 estándar que es más robusto para imágenes
-        self.encoder = SentenceTransformer("sentence-transformers/clip-vit-b-32-multilingual-v1")
+        self.encoder = SentenceTransformer("sentence-transformers/clip-ViT-B-32")
         self.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
         
         # 3. Configurar Gemini (RAG)
         api_key = os.getenv("GOOGLE_API_KEY")
         if api_key:
-            genai.configure(api_key=api_key)
-            self.llm = genai.GenerativeModel('gemini-1.5-flash')
+            self.llm = genai.Client(api_key=api_key)
         else:
             print("ADVERTENCIA: No se encontró GOOGLE_API_KEY en el archivo .env")
             self.llm = None
@@ -55,10 +55,14 @@ class MotorBusqueda:
             imagen_procesada = consulta.convert("RGB")
             
             # 2. Pasar como LISTA [imagen] para que la librería no intente "leerla" como texto
-            vector = self.encoder.encode([imagen_procesada])[0] 
+            vector = self.encoder.encode(
+                imagen_procesada,  # PIL Image directamente, SIN lista
+                convert_to_numpy=True,
+                show_progress_bar=False
+                )
             
         # Normalizar vector (L2 norm) para búsqueda por coseno
-        vector = vector.reshape(1, -1).astype('float32')
+        vector = np.array(vector).reshape(1, -1).astype('float32')
         faiss.normalize_L2(vector)
         
         # B. Recuperación Inicial (FAISS)
@@ -68,7 +72,7 @@ class MotorBusqueda:
         # indices[0] porque faiss devuelve una matriz
         for idx in indices[0]:
             if idx != -1 and idx < len(self.metadata): # Chequeo de seguridad
-                candidatos.append(self.metadata[idx])
+                candidatos.append(self.metadata[idx].copy()) # Copia para no modificar el original
         
         # C. Re-ranking (Cross-Encoder)
         # El Cross-Encoder funciona comparando TEXTO vs TEXTO.
@@ -133,12 +137,12 @@ class MotorBusqueda:
         3. Si el usuario pide un cambio (ej. "mejor en rojo"), busca en el contexto si hay algo relevante o explica que estás mostrando las mejores coincidencias visuales/textuales.
         4. Justifica tu respuesta usando la información provista (RAG).
         5. Sé amable, breve y persuasivo.
-        3. Si la búsqueda fue por imagen, menciona que encontraste artículos visualmente similares.
-        4. Si la consulta actual no tiene relación con los productos, responde educadamente.
+        6. Si la búsqueda fue por imagen, menciona que encontraste artículos visualmente similares.
+        7. Si la consulta actual no tiene relación con los productos, responde educadamente.
         """
         
         try:
-            response = self.llm.generate_content(prompt)
+            response = self.llm.models.generate_content(model="gemini-3-flash-preview", contents=prompt)
             return response.text
         except Exception as e:
             return f"Ocurrió un error generando la respuesta: {e}"

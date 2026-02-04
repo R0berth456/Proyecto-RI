@@ -1,3 +1,4 @@
 /env
 .env
 /indices
+/__pycache__
