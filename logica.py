@@ -2,12 +2,12 @@ import os
 import json
 import faiss
 import numpy as np
-from google import genai
+import google.generativeai as genai
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from PIL import Image
 
-load_dotenv()  # Cargar variables de entorno desde .env
+load_dotenv()
 
 class MotorBusqueda:
     def __init__(self):
@@ -15,36 +15,49 @@ class MotorBusqueda:
         self.path_index = "indices/productos.faiss"
         self.path_meta = "indices/metadata.json"
         
-        # 1. Cargar Índices Pre-calculados
+        # 1. Cargar Índices
         print("Cargando índices...")
-        self.index = faiss.read_index(self.path_index)
-        with open(self.path_meta, 'r') as f:
-            self.metadata = json.load(f)
+        try:
+            self.index = faiss.read_index(self.path_index)
+            with open(self.path_meta, 'r', encoding='utf-8') as f:
+                self.metadata = json.load(f)
+        except Exception as e:
+            print(f"Error fatal cargando índices: {e}")
+            self.index = None
+            self.metadata = []
             
-        # 2. Cargar Modelos (Solo para codificar la consulta, es rápido)
-        print("Cargando modelos...")
+        # 2. Cargar Modelos
+        print("Cargando modelos de IA...")
+        # Usamos clip-ViT-B-32 estándar que es más robusto para imágenes
         self.encoder = SentenceTransformer("sentence-transformers/clip-vit-b-32-multilingual-v1")
-        self.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2") # Versión Mini es más rápida
+        self.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
         
         # 3. Configurar Gemini (RAG)
         api_key = os.getenv("GOOGLE_API_KEY")
         if api_key:
-            self.llm = genai.Client(api_key=api_key)
+            genai.configure(api_key=api_key)
+            self.llm = genai.GenerativeModel('gemini-1.5-flash')
         else:
-            print("ADVERTENCIA: No se encontró GOOGLE_API_KEY")
+            print("ADVERTENCIA: No se encontró GOOGLE_API_KEY en el archivo .env")
             self.llm = None
 
     def buscar(self, consulta, tipo="texto", top_k=20, top_k_rerank=3):
-        """Pipeline completo: Recuperación -> Re-ranking -> Contexto"""
-        
+        """Pipeline: Recuperación -> Re-ranking"""
+        if not self.index:
+            return []
+
         # A. Codificar consulta (Texto o Imagen)
         if tipo == "texto":
             vector = self.encoder.encode(consulta)
         else:
-            # Asumimos que consulta es un objeto PIL Image
-            vector = self.encoder.encode(consulta)
+            # --- CORRECCIÓN IMPORTANTE PARA IMÁGENES ---
+            # 1. Convertir a RGB para evitar errores con PNGs transparentes
+            imagen_procesada = consulta.convert("RGB")
             
-        # Normalizar vector
+            # 2. Pasar como LISTA [imagen] para que la librería no intente "leerla" como texto
+            vector = self.encoder.encode([imagen_procesada])[0] 
+            
+        # Normalizar vector (L2 norm) para búsqueda por coseno
         vector = vector.reshape(1, -1).astype('float32')
         faiss.normalize_L2(vector)
         
@@ -52,20 +65,34 @@ class MotorBusqueda:
         distances, indices = self.index.search(vector, top_k)
         
         candidatos = []
+        # indices[0] porque faiss devuelve una matriz
         for idx in indices[0]:
-            if idx < len(self.metadata):
+            if idx != -1 and idx < len(self.metadata): # Chequeo de seguridad
                 candidatos.append(self.metadata[idx])
         
         # C. Re-ranking (Cross-Encoder)
-        # Solo aplicamos re-ranking si es búsqueda de texto (Cross-Encoder suele ser texto-texto)
+        # El Cross-Encoder funciona comparando TEXTO vs TEXTO.
+        # Si la búsqueda es por IMAGEN, no podemos usar Cross-Encoder fácilmente 
+        # (porque requiere texto del usuario), así que devolvemos los mejores de FAISS directo.
+        
         resultados_finales = candidatos
+        
         if tipo == "texto" and candidatos:
-            pairs = [[consulta, f"{c['gender']} {c['category']} {c['subcategory']} {c['product_type']} {c['colour']} {c['usage']} {c['name']}"] for c in candidatos]
+            # Creamos pares [Consulta, Descripción del producto]
+            pairs = []
+            for c in candidatos:
+                # Construimos una descripción rica para que el modelo entienda
+                desc = f"{c.get('name','')} {c.get('category','')} {c.get('colour','')} {c.get('usage','')}"
+                pairs.append([consulta, desc])
+            
+            # Predecir relevancia
             scores = self.reranker.predict(pairs)
             
-            # Ordenar por nuevo score
+            # Asignar scores y reordenar
             for i, c in enumerate(candidatos):
                 c['score'] = float(scores[i])
+            
+            # Ordenar de mayor a menor score
             resultados_finales = sorted(candidatos, key=lambda x: x['score'], reverse=True)
         
         return resultados_finales[:top_k_rerank]
@@ -73,34 +100,45 @@ class MotorBusqueda:
     def generar_respuesta(self, consulta, productos, historial=[]):
         """Generación RAG con Gemini"""
         if not self.llm:
-            return "Error: API Key no configurada."
+            return "Lo siento, no tengo conexión con el cerebro de IA (API Key faltante)."
+        
+        if not productos:
+            return "No encontré productos similares en el catálogo."
 
-        # Construir contexto
+        # Construir contexto de productos (Texto enriquecido)
         contexto_prods = "\n".join([
-            f"- {p['name']} (Category: {p['category']}, Subcategory: {p['subcategory']}, Colour: {p['colour']}, Usage: {p['usage']}, Product_Type: {p['product_type']}, Gender: {p['gender']})."
+            f"- PRODUCTO: {p.get('name', 'N/A')}\n"
+            f"  Detalles: {p.get('category','')} para {p.get('gender','')}, color {p.get('colour','')}.\n"
+            f"  Uso: {p.get('usage','')}. Tipo: {p.get('product_type','')}"
             for p in productos
         ])
         
-        # Historial de chat simple
+        # Historial (últimos 3 mensajes)
         chat_context = "\n".join([f"{h['role']}: {h['content']}" for h in historial[-3:]])
 
         prompt = f"""
-        Actúa como un asistente experto de e-commerce.
+        Eres un asistente de moda experto y amable (Fashion Stylist).
         
-        HISTORIAL DE CONVERSACIÓN:
+        HISTORIAL RECIENTE:
         {chat_context}
         
-        CONSULTA ACTUAL DEL USUARIO: {consulta}
+        CONSULTA DEL USUARIO: "{consulta}"
         
-        PRODUCTOS ENCONTRADOS (Contexto):
+        HEMOS ENCONTRADO ESTOS PRODUCTOS EN EL CATÁLOGO:
         {contexto_prods}
         
-        INSTRUCCIONES:
+        TU TAREA:
         1. Recomienda el/los mejor(es) producto(s) de la lista anterior basándote en la consulta.
-        2. Justifica tu respuesta usando la información provista (RAG).
+        2. Explica por qué combinan con lo que busca (basado en color, estilo, uso).
         3. Si el usuario pide un cambio (ej. "mejor en rojo"), busca en el contexto si hay algo relevante o explica que estás mostrando las mejores coincidencias visuales/textuales.
-        4. Sé amable, breve y persuasivo.
-        5. Si la consulta actual no tiene relación con los productos, responde educadamente"""
+        4. Justifica tu respuesta usando la información provista (RAG).
+        5. Sé amable, breve y persuasivo.
+        3. Si la búsqueda fue por imagen, menciona que encontraste artículos visualmente similares.
+        4. Si la consulta actual no tiene relación con los productos, responde educadamente.
+        """
         
-        response = self.llm.models.generate_content(model="gemini-3-flash-preview", contents=prompt)
-        return response.text
+        try:
+            response = self.llm.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            return f"Ocurrió un error generando la respuesta: {e}"
