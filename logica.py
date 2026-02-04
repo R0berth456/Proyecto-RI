@@ -29,7 +29,7 @@ class MotorBusqueda:
         # 3. Configurar Gemini (RAG)
         api_key = os.getenv("GOOGLE_API_KEY")
         if api_key:
-            self.llm = genai.Client(api_key=api_key, model="gemini-1.5-flash")
+            self.llm = genai.Client(api_key=api_key)
         else:
             print("ADVERTENCIA: No se encontró GOOGLE_API_KEY")
             self.llm = None
@@ -102,5 +102,5 @@ class MotorBusqueda:
         4. Sé amable, breve y persuasivo.
         """
         
-        response = self.llm.generate_content(prompt)
+        response = self.llm.models.generate_content(model="gemini-3-flash-preview", contents=prompt)
         return response.text
